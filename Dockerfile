@@ -3,7 +3,8 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    DENO_INSTALL=/usr/local/deno
+    DENO_INSTALL=/usr/local/deno \
+    TINI_SUBREAPER=1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -26,7 +27,8 @@ RUN mkdir -p "$DENO_INSTALL" \
 
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --upgrade pip \
+RUN python --version \
+    && pip install --upgrade pip \
     && pip install -r requirements.txt
 
 COPY . .
@@ -37,5 +39,6 @@ RUN mkdir -p /app/downloads /app/cache/tommy_thumbnails /app/cookies \
 
 USER tommy
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# -s registers Tini as a child subreaper even when Northflank wraps the container.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["python3", "-m", "VenomX"]
