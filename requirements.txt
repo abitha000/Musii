@@ -1,33 +1,31 @@
 async-lru
- aiofiles
- aiohttp
- asyncio
- beautifulsoup4
- dnspython
- ffmpeg-python
- gitpython
- hachoir
- heroku3
- httpx[http2]
- motor
- pillow==9.5.0
- psutil
- pytube
- pykeyboard
- py-tgcalls==2.3.3
- ntgcalls==2.2.5
- python-dotenv
- pyyaml
- requests
- speedtest-cli
- spotipy
- tgcrypto
- urllib3
- uvloop
- flask
- gunicorn
+aiofiles
+aiohttp
+beautifulsoup4
+dnspython
+ffmpeg-python
+gitpython
+hachoir
+heroku3
+httpx[http2]
+motor
+pillow==9.5.0
+psutil
+pytube
+pykeyboard
+py-tgcalls==2.3.3
+ntgcalls==2.2.5
+python-dotenv
+pyyaml
+requests
+speedtest-cli
+spotipy
+tgcrypto
+urllib3
+uvloop
+flask
+gunicorn
 yt-dlp[default]>=2026.08.19
 yt-dlp-getpot-wpc==1.1.2
 py-yt-search>=0.2
 pyroblack
-".replace(" 
