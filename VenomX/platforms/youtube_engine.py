@@ -17,12 +17,13 @@ from .Youtube import YouTube as LegacyYouTube
 _LOG_TAG = "YoutubeEngine"
 _CACHE_TTL = 240.0
 _MAX_CACHE = 512
-_EXTRACT_TIMEOUT = 35.0
+_EXTRACT_TIMEOUT = 90.0
 _DOWNLOAD_TIMEOUT = 600.0
 _DOWNLOAD_DIR = Path("downloads")
 _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 _COOKIE_RUNTIME_PATH = Path("/tmp/tommy-youtube-cookies.txt")
-_CLIENT_PROFILES = ("web_safari", "mweb", "web", "tv")
+# WPC supports these clients and can mint the PO tokens required by GVS.
+_CLIENT_PROFILES = ("web_music", "web_safari", "mweb", "web", "tv")
 _USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 _STREAM_CACHE: dict[tuple[str, bool], tuple[float, str]] = {}
 _PREFETCH_TASKS: dict[tuple[str, bool], asyncio.Task] = {}
@@ -85,15 +86,11 @@ def _js_runtimes() -> dict:
     return {}
 
 
-def _common_options(client: str, *, use_pot: bool, **extra) -> dict:
-    youtube_args = {"player_client": [client]}
-    # Only invoke WPC for mweb/web clients. web_safari should stay a fast,
-    # browser-free attempt so an unavailable format cannot spend ~60s in WPC.
-    if use_pot:
-        youtube_args["fetch_pot"] = ["auto"]
+def _common_options(client: str, **extra) -> dict:
+    youtube_args = {"player_client": [client], "fetch_pot": ["auto"]}
     extractor_args = {"youtube": youtube_args}
     browser = _browser_path()
-    if browser and use_pot:
+    if browser:
         extractor_args["youtubepot-wpc"] = {"browser_path": browser}
 
     opts = {
@@ -107,10 +104,10 @@ def _common_options(client: str, *, use_pot: bool, **extra) -> dict:
         "no_warnings": True,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "extractor_retries": 1,
-        "fragment_retries": 2,
-        "retries": 2,
-        "socket_timeout": 10,
+        "extractor_retries": 2,
+        "fragment_retries": 4,
+        "retries": 3,
+        "socket_timeout": 15,
         "concurrent_fragment_downloads": 4,
         "buffersize": "1M",
     }
@@ -120,25 +117,28 @@ def _common_options(client: str, *, use_pot: bool, **extra) -> dict:
 
 
 def _format_candidates(fmt: str) -> list[str]:
-    candidates = [fmt]
     if fmt.startswith("bestaudio"):
-        candidates.extend(["best", "18"])
-    elif fmt.startswith("best["):
-        candidates.extend(["best", "18"])
-    elif fmt == "best":
-        candidates.append("18")
-    return list(dict.fromkeys(candidates))
+        return [
+            "bestaudio[ext=m4a]/bestaudio/best",
+            "bestaudio",
+            "best",
+        ]
+    if fmt.startswith("best["):
+        return [
+            "best[height<=720]/best[height<=1080]/best",
+            "best",
+        ]
+    return [fmt, "best"] if fmt != "best" else ["best"]
 
 
 def _extract_sync(url: str, fmt: str, *, download: bool = False, **extra):
     last_error = None
     for client in _CLIENT_PROFILES:
-        use_pot = client in {"mweb", "web"}
         for candidate in _format_candidates(fmt):
-            options = _common_options(client, use_pot=use_pot, format=candidate, **extra)
+            options = _common_options(client, format=candidate, **extra)
             started = time.monotonic()
             try:
-                _log("info", "extracting client=%s format=%s pot=%s", client, candidate, use_pot)
+                _log("info", "extracting client=%s format=%s pot=wpc", client, candidate)
                 with YoutubeDL(options) as ydl:
                     info = ydl.extract_info(url, download=download)
                 _log("info", "client=%s format=%s extraction succeeded in %.1fs", client, candidate, time.monotonic() - started)
@@ -176,9 +176,13 @@ class YouTubeResilient(LegacyYouTube):
         if "youtube.com/" in url or "youtu.be/" in url:
             info = await _extract(url, "best", download=False, skip_download=True)
             duration = info.get("duration") or 0
-            duration_min = self._duration_text(duration)
-            thumbnail = info.get("thumbnail") or f"https://img.youtube.com/vi/{info['id']}/maxresdefault.jpg"
-            return info.get("title") or "Unknown title", duration_min, int(duration), thumbnail.split("?", 1)[0], info["id"]
+            return (
+                info.get("title") or "Unknown title",
+                self._duration_text(duration),
+                int(duration),
+                (info.get("thumbnail") or f"https://img.youtube.com/vi/{info['id']}/maxresdefault.jpg").split("?", 1)[0],
+                info["id"],
+            )
         return await super().details(link, videoid)
 
     @staticmethod
@@ -224,14 +228,13 @@ class YouTubeResilient(LegacyYouTube):
             _log("info", "stream cache hit video=%s", video)
             return 1, cached[1]
         url = _youtube_url(link, bool(videoid))
-        fmt = "best[height<=720]/18/best" if video else "bestaudio/best/18"
+        fmt = "best[height<=720]/best" if video else "bestaudio/best"
         try:
             info = await _extract(url, fmt, download=False, skip_download=True)
             direct = info.get("url")
             if not direct:
                 requested = info.get("requested_formats") or []
-                if requested:
-                    direct = requested[0].get("url")
+                direct = next((item.get("url") for item in requested if item.get("url")), None)
             if not direct:
                 raise RuntimeError("yt-dlp returned no direct stream URL")
             _STREAM_CACHE[key] = (time.monotonic(), direct)
@@ -279,11 +282,10 @@ class YouTubeResilient(LegacyYouTube):
         def _download_sync():
             last_error = None
             for client in _CLIENT_PROFILES:
-                use_pot = client in {"mweb", "web"}
                 for candidate in _format_candidates(fmt):
-                    options = _common_options(client, use_pot=use_pot, format=candidate, **extra)
+                    options = _common_options(client, format=candidate, **extra)
                     try:
-                        _log("info", "download client=%s format=%s pot=%s", client, candidate, use_pot)
+                        _log("info", "download client=%s format=%s pot=wpc", client, candidate)
                         with YoutubeDL(options) as ydl:
                             info = ydl.extract_info(url, download=True)
                             prepared = Path(ydl.prepare_filename(info))
