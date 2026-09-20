@@ -18,11 +18,16 @@ from .Youtube import YouTube as LegacyYouTube
 _LOG_TAG = "YoutubeEngine"
 _CACHE_TTL = 240.0
 _MAX_CACHE = 512
+_EXTRACT_TIMEOUT = 60.0
+_DOWNLOAD_TIMEOUT = 600.0
 _DOWNLOAD_DIR = Path("downloads")
 _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 _COOKIE_RUNTIME_PATH = Path("/tmp/tommy-youtube-cookies.txt")
 
-_CLIENT_PROFILES = ("mweb", "web_safari", "web", "tv")
+# web_safari can expose HLS formats that currently avoid GVS PO-token
+# requirements; mweb remains the recommended PO-token client and is kept
+# immediately behind it as the normal direct-stream fallback.
+_CLIENT_PROFILES = ("web_safari", "mweb", "web", "tv")
 
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -92,16 +97,22 @@ def _js_runtimes() -> dict:
 
 
 def _common_options(client: str, **extra) -> dict:
-    extractor_args = {"youtube": {"player_client": [client], "fetch_pot": ["auto"]}}
+    extractor_args = {
+        "youtube": {
+            "player_client": [client],
+            "fetch_pot": ["auto"],
+        }
+    }
     browser = _browser_path()
     if browser:
-        # WPC documents browser_path as its supported custom-browser option.
+        # WPC's documented option name is youtubepot-wpc:browser_path.
         extractor_args["youtubepot-wpc"] = {"browser_path": browser}
 
     opts = {
         "extractor_args": extractor_args,
         "js_runtimes": _js_runtimes(),
-        "remote_components": ["ejs:github"],
+        # EJS is installed with yt-dlp[default]; avoid an unnecessary
+        # GitHub fetch on every extraction in a restricted container.
         "cookiefile": _cookie_file(),
         "proxy": os.getenv("PROXY_URL", "").strip() or None,
         "http_headers": {"User-Agent": _USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
@@ -110,9 +121,9 @@ def _common_options(client: str, **extra) -> dict:
         "no_warnings": True,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "extractor_retries": 3,
-        "fragment_retries": 5,
-        "retries": 5,
+        "extractor_retries": 2,
+        "fragment_retries": 3,
+        "retries": 3,
         "socket_timeout": 15,
         "concurrent_fragment_downloads": 4,
         "buffersize": "1M",
@@ -126,14 +137,29 @@ def _extract_sync(url: str, fmt: str, *, download: bool = False, **extra):
     last_error = None
     for client in _CLIENT_PROFILES:
         options = _common_options(client, format=fmt, **extra)
+        started = time.monotonic()
         try:
             _log("info", "extracting client=%s format=%s", client, fmt)
             with YoutubeDL(options) as ydl:
-                return ydl.extract_info(url, download=download)
+                info = ydl.extract_info(url, download=download)
+            _log("info", "client=%s extraction succeeded in %.1fs", client, time.monotonic() - started)
+            return info
         except Exception as exc:
             last_error = exc
-            _log("warning", "client=%s failed: %s", client, exc)
+            _log("warning", "client=%s failed after %.1fs: %s", client, time.monotonic() - started, exc)
     raise RuntimeError(f"all YouTube extraction profiles failed: {last_error}")
+
+
+async def _extract(url: str, fmt: str, *, download: bool = False, timeout: float = _EXTRACT_TIMEOUT, **extra):
+    """Run blocking yt-dlp outside the event loop with a hard upper bound."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_extract_sync, url, fmt, download=download, **extra),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        _log("error", "YouTube extraction timed out after %.0fs: %s", timeout, url[:100])
+        raise RuntimeError(f"YouTube extraction timed out after {timeout:.0f}s") from exc
 
 
 def _cleanup_cache():
@@ -150,7 +176,7 @@ class YouTubeResilient(LegacyYouTube):
     async def details(self, link: str, videoid: bool | str = None):
         url = _youtube_url(link, bool(videoid))
         if "youtube.com/" in url or "youtu.be/" in url:
-            info = await asyncio.to_thread(_extract_sync, url, "best", download=False, skip_download=True)
+            info = await _extract(url, "best", download=False, skip_download=True)
             duration = info.get("duration") or 0
             duration_min = self._duration_text(duration)
             thumbnail = info.get("thumbnail") or f"https://img.youtube.com/vi/{info['id']}/maxresdefault.jpg"
@@ -177,7 +203,7 @@ class YouTubeResilient(LegacyYouTube):
         except Exception as exc:
             _log("warning", "py_yt search failed: %s", exc)
 
-        info = await asyncio.to_thread(_extract_sync, f"ytsearch1:{link}", "best", download=False, skip_download=True)
+        info = await _extract(f"ytsearch1:{link}", "best", download=False, skip_download=True)
         entry = (info.get("entries") or [None])[0]
         if not entry:
             raise RuntimeError("YouTube search returned no results")
@@ -198,20 +224,22 @@ class YouTubeResilient(LegacyYouTube):
         key = (str(link), bool(video))
         cached = _STREAM_CACHE.get(key)
         if cached and time.monotonic() - cached[0] < _CACHE_TTL:
+            _log("info", "stream cache hit video=%s", video)
             return 1, cached[1]
         url = _youtube_url(link, bool(videoid))
         fmt = "best[height<=720]/18/best" if video else "bestaudio/best/18"
         try:
-            info = await asyncio.to_thread(_extract_sync, url, fmt, download=False, skip_download=True)
+            info = await _extract(url, fmt, download=False, skip_download=True)
             direct = info.get("url")
             if not direct:
                 requested = info.get("requested_formats") or []
-                if requested and requested[0].get("url"):
-                    direct = requested[0]["url"]
+                if requested:
+                    direct = requested[0].get("url")
             if not direct:
                 raise RuntimeError("yt-dlp returned no direct stream URL")
             _STREAM_CACHE[key] = (time.monotonic(), direct)
             _cleanup_cache()
+            _log("info", "direct stream ready video=%s protocol=%s", video, info.get("protocol", "unknown"))
             return 1, direct
         except Exception as exc:
             _log("error", "stream_url failed for %s: %s", url[:90], exc)
@@ -256,6 +284,7 @@ class YouTubeResilient(LegacyYouTube):
             for client in _CLIENT_PROFILES:
                 options = _common_options(client, format=fmt, **extra)
                 try:
+                    _log("info", "download client=%s format=%s", client, fmt)
                     with YoutubeDL(options) as ydl:
                         info = ydl.extract_info(url, download=True)
                         if songaudio:
@@ -275,7 +304,11 @@ class YouTubeResilient(LegacyYouTube):
                     _log("warning", "download client=%s failed: %s", client, exc)
             raise RuntimeError(f"all YouTube download profiles failed: {last_error}")
 
-        path = await asyncio.to_thread(_download_sync)
+        try:
+            path = await asyncio.wait_for(asyncio.to_thread(_download_sync), timeout=_DOWNLOAD_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            _log("error", "YouTube download timed out after %.0fs", _DOWNLOAD_TIMEOUT)
+            raise RuntimeError(f"YouTube download timed out after {_DOWNLOAD_TIMEOUT:.0f}s") from exc
         return path, True
 
 
