@@ -1,13 +1,10 @@
-
 # All rights reserved.
 #
 import asyncio
-import sys
 
 from pyrogram import Client
 from pyrogram.errors import ChatWriteForbidden
 import config
-
 from ..logging import LOGGER
 
 assistants = []
@@ -18,79 +15,71 @@ class Userbot(Client):
     def __init__(self):
         self.clients = []
         self.sessions = config.STRING_SESSIONS
-
         for i, session in enumerate(self.sessions, start=1):
-
-            client = Client(
+            self.clients.append(Client(
                 f"VenomString{i}",
                 api_id=config.API_ID,
                 api_hash=config.API_HASH,
                 in_memory=True,
                 no_updates=True,
                 session_string=session.strip(),
-            )
-            self.clients.append(client)
+            ))
 
     async def _start(self, client, index):
         LOGGER(__name__).info("Starting Assistant Clients")
         try:
             await client.start()
-            assistants.append(index)
-            try:
-                get_me = await client.get_me()
-                client.username = get_me.username
-                client.id = get_me.id
-                client.mention = get_me.mention
+            if index not in assistants:
+                assistants.append(index)
+            get_me = await client.get_me()
+            client.username = get_me.username
+            client.id = get_me.id
+            client.mention = get_me.mention
+            if get_me.id not in assistantids:
                 assistantids.append(get_me.id)
-                client.name = f"{get_me.first_name} {get_me.last_name or ''}".strip()
-
-                assistant_msg = f"""
-╔══════════════════════╗
-  🤖 **ᴀssɪsᴛᴀɴᴛ sᴛᴀʀᴛᴇᴅ** 🤖
-╚══════════════════════╝
-
-┌──────────────────────┐
-│ 🧑 **ɴᴀᴍᴇ :** {client.name}
-│ 🔑 **ɪᴅ :** <code>{client.id}</code>
-│ 🔗 **ᴜsᴇʀɴᴀᴍᴇ :** @{client.username}
-│ 🔢 **ɪɴsᴛᴀɴᴄᴇ :** #{index}
-│ 📡 **sᴛᴀᴛᴜs :** ✅ ᴀᴄᴛɪᴠᴇ
-│ 🎵 **ʀᴏʟᴇ :** ᴠᴏɪᴄᴇᴄʜᴀᴛ ᴀssɪsᴛᴀɴᴛ
-└──────────────────────┘
-
-⚡ **ʀᴇᴀᴅʏ ᴛᴏ ᴊᴏɪɴ ᴠᴏɪᴄᴇᴄʜᴀᴛs**
-💎 **ᴘʀᴇᴍɪᴜᴍ sᴛʀᴇᴀᴍɪɴɢ ᴀᴄᴛɪᴠᴇ**
-🔥 **ᴘʀᴏxʏ :** ᴄʟᴏᴜᴅғʟᴀʀᴇ ᴡᴀʀᴘ
-"""
+            client.name = f"{get_me.first_name} {get_me.last_name or ''}".strip()
+            assistant_msg = (
+                "╔══════════════════════╗\n"
+                "  🤖 **ᴀssɪsᴛᴀɴᴛ sᴛᴀʀᴛᴇᴅ** 🤖\n"
+                "╚══════════════════════╝\n\n"
+                f"🧑 **ɴᴀᴍᴇ:** {client.name}\n"
+                f"🔑 **ɪᴅ:** <code>{client.id}</code>\n"
+                f"🔗 **ᴜsᴇʀɴᴀᴍᴇ:** @{client.username}\n"
+                f"🔢 **ɪɴsᴛᴀɴᴄᴇ:** #{index}\n"
+                "📡 **sᴛᴀᴛᴜs:** ✅ ᴀᴄᴛɪᴠᴇ\n"
+                "🎵 **ʀᴏʟᴇ:** ᴠᴏɪᴄᴇᴄʜᴀᴛ ᴀssɪsᴛᴀɴᴛ\n"
+            )
+            try:
                 await client.send_message(config.LOGGER_ID, assistant_msg)
             except ChatWriteForbidden:
                 try:
                     await client.join_chat(config.LOGGER_ID)
                     await client.send_message(config.LOGGER_ID, assistant_msg)
-                except Exception:
-                    LOGGER(__name__).error(
-                        f"Assistant Account {index} has failed to send message in Loggroup Make sure you have added assistsant in Loggroup."
-                    )
-                    sys.exit(1)
-
+                except Exception as exc:
+                    LOGGER(__name__).error(f"Assistant {index} could not write to logger: {exc}")
+                    # Logger delivery must never kill a working assistant.
         except Exception as e:
-            LOGGER(__name__).error(
-                f"Assistant Account {index} failed with error: {str(e)}."
-            )
-            sys.exit(1)
+            LOGGER(__name__).error(f"Assistant Account {index} failed with error: {e}")
+            # Do not sys.exit() from an individual assistant task.  A bad logger,
+            # transient Telegram error, or one invalid session must not kill the bot.
+            raise
 
     async def start(self):
-        tasks = []  # List to hold start tasks
-        for i, client in enumerate(self.clients, start=1):
-            task = self._start(client, i)
-            tasks.append(task)
-        await asyncio.gather(*tasks)
+        if not self.clients:
+            raise RuntimeError("No assistant string sessions configured")
+        results = await asyncio.gather(
+            *(self._start(client, i) for i, client in enumerate(self.clients, start=1)),
+            return_exceptions=True,
+        )
+        failures = [r for r in results if isinstance(r, Exception)]
+        if len(failures) == len(self.clients):
+            raise RuntimeError(f"All assistant sessions failed: {failures[0]}")
+        if failures:
+            LOGGER(__name__).warning(f"{len(failures)} assistant session(s) failed; continuing with healthy assistants")
 
     async def stop(self):
-        """Gracefully stop all clients."""
-        tasks = [client.stop() for client in self.clients]
-        await asyncio.gather(*tasks)
-    
+        await asyncio.gather(*(client.stop() for client in self.clients), return_exceptions=True)
+
     def __getattr__(self, name):
         if not self.clients:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
