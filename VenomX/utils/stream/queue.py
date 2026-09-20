@@ -1,9 +1,26 @@
 # All rights reserved.
 
+import asyncio
 from typing import Union
+
 from config import autoclean, chatstats, userstats
 from config.config import time_to_seconds
 from VenomX.misc import db
+
+
+async def _prefetch_youtube(vidid: str, stream: str):
+    """Warm the next YouTube direct URL without delaying queue insertion."""
+    if not vidid or not str(vidid).strip():
+        return
+    if stream not in ("audio", "video"):
+        return
+    try:
+        from VenomX import Platform
+        await Platform.youtube.prefetch(vidid, video=(stream == "video"))
+    except Exception:
+        # Prefetch is an optimization only. Playback always retains its normal
+        # extraction/download fallback path.
+        return
 
 
 async def put_queue(
@@ -19,24 +36,19 @@ async def put_queue(
     url: str = None,
     forceplay: Union[bool, str] = False,
 ):
-    # Normalize title
     title = title.title()
 
-    # Convert duration safely
     try:
         duration_in_seconds = max(time_to_seconds(duration) - 3, 0)
     except Exception:
         duration_in_seconds = 0
 
-    # Initialize queue if not exists
     if chat_id not in db:
         db[chat_id] = []
 
-    # Normalize vidid
     if vidid in ("soundcloud", "saavn"):
         vidid = "telegram"
 
-    # Song payload
     put = {
         "title": title,
         "dur": duration,
@@ -50,42 +62,27 @@ async def put_queue(
         "url": url,
     }
 
-    # Queue logic
     if forceplay and db[chat_id]:
-        # Insert after currently playing track
         db[chat_id].insert(1, put)
     else:
         db[chat_id].append(put)
 
-    # Auto clean temp files
     autoclean.append(file)
 
-    # Chat stats
     if chat_id not in chatstats:
         chatstats[chat_id] = []
+    chatstats[chat_id].append({"vidid": vidid, "title": title})
 
-    chatstats[chat_id].append(
-        {
-            "vidid": vidid,
-            "title": title,
-        }
-    )
-
-    # User stats (DO NOT touch queue here)
     if user_id not in userstats:
         userstats[user_id] = []
+    userstats[user_id].append({"chat_id": chat_id, "title": title})
 
-    userstats[user_id].append(
-        {
-            "chat_id": chat_id,
-            "title": title,
-        }
-    )
+    # Start prefetch after the queue item is safely stored. Never await it here;
+    # a slow YouTube response must not block Telegram queue operations.
+    if len(db[chat_id]) > 1 and str(vidid).strip() and str(vidid) != "telegram":
+        asyncio.create_task(_prefetch_youtube(str(vidid), str(stream)))
 
-    # Return queue position
     return len(db[chat_id])
-
-
 
 
 async def put_queue_index(
@@ -99,15 +96,12 @@ async def put_queue_index(
     stream: str,
     forceplay: Union[bool, str] = False,
 ):
-    # Initialize queue if missing
     if chat_id not in db:
         db[chat_id] = []
 
-    # Normalize vidid
     if vidid in ("soundcloud", "saavn"):
         vidid = "telegram"
 
-    # Build queue item
     put = {
         "title": title.title(),
         "dur": duration,
@@ -120,16 +114,12 @@ async def put_queue_index(
         "played": 0,
     }
 
-    # Correct forceplay behavior
     if forceplay and db[chat_id]:
-        # Insert AFTER currently playing track
         db[chat_id].insert(1, put)
     else:
         db[chat_id].append(put)
 
-    # Return correct queue position (1-based)
+    if len(db[chat_id]) > 1 and str(vidid).strip() and str(vidid) != "telegram":
+        asyncio.create_task(_prefetch_youtube(str(vidid), str(stream)))
+
     return len(db[chat_id])
-
-
-
-
