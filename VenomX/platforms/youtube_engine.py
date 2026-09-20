@@ -22,14 +22,7 @@ _DOWNLOAD_DIR = Path("downloads")
 _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 _COOKIE_RUNTIME_PATH = Path("/tmp/tommy-youtube-cookies.txt")
 
-# Profiles are tried independently. This avoids relying on one YouTube client
-# when YouTube changes SABR/PO-token behaviour for another client.
-_CLIENT_PROFILES = (
-    "mweb",
-    "web_safari",
-    "web",
-    "tv",
-)
+_CLIENT_PROFILES = ("mweb", "web_safari", "web", "tv")
 
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -52,7 +45,6 @@ def _youtube_url(value: str, videoid: bool = False) -> str:
 
 
 def _cookie_file() -> Optional[str]:
-    """Return a safe runtime cookie file without requiring secrets in Git."""
     encoded = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     raw = os.getenv("YOUTUBE_COOKIES", "")
     if encoded or raw:
@@ -100,18 +92,11 @@ def _js_runtimes() -> dict:
 
 
 def _common_options(client: str, **extra) -> dict:
-    extractor_args = {
-        "youtube": {
-            "player_client": [client],
-            "fetch_pot": ["auto"],
-        }
-    }
+    extractor_args = {"youtube": {"player_client": [client], "fetch_pot": ["auto"]}}
     browser = _browser_path()
     if browser:
-        extractor_args["youtubepot-wpc"] = {
-            "browser_path": browser,
-            "no_sandbox": True,
-        }
+        # WPC documents browser_path as its supported custom-browser option.
+        extractor_args["youtubepot-wpc"] = {"browser_path": browser}
 
     opts = {
         "extractor_args": extractor_args,
@@ -119,10 +104,7 @@ def _common_options(client: str, **extra) -> dict:
         "remote_components": ["ejs:github"],
         "cookiefile": _cookie_file(),
         "proxy": os.getenv("PROXY_URL", "").strip() or None,
-        "http_headers": {
-            "User-Agent": _USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        "http_headers": {"User-Agent": _USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -218,8 +200,6 @@ class YouTubeResilient(LegacyYouTube):
         if cached and time.monotonic() - cached[0] < _CACHE_TTL:
             return 1, cached[1]
         url = _youtube_url(link, bool(videoid))
-        # PyTgCalls accepts one media URL. For video, select a single-file
-        # audio+video format capped at 720p to prevent the old video-only URL bug.
         fmt = "best[height<=720]/18/best" if video else "bestaudio/best/18"
         try:
             info = await asyncio.to_thread(_extract_sync, url, fmt, download=False, skip_download=True)
