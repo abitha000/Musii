@@ -17,21 +17,24 @@ from .Youtube import YouTube as LegacyYouTube
 _LOGGER_NAME = "VenomX.platforms.youtube_engine"
 _CACHE_TTL = 240.0
 _MAX_CACHE = 512
-_EXTRACT_TIMEOUT = 120.0
-_DOWNLOAD_TIMEOUT = 900.0
+# Keep the async extraction deadline short enough that a stuck YouTube client
+# cannot hold the music command for minutes.  Individual yt-dlp options below
+# also have short network timeouts so the worker can move to the next client.
+_EXTRACT_TIMEOUT = 45.0
+_DOWNLOAD_TIMEOUT = 240.0
 _DOWNLOAD_DIR = Path("downloads")
 _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 _COOKIE_RUNTIME_PATH = Path("/tmp/tommy-youtube-cookies.txt")
 
-# Current yt-dlp guidance recommends mweb with a PO-token provider for GVS.
-# web_safari can provide HLS without a GVS PO token, and tv is a useful final
-# fallback. Keep the list short: repeatedly invoking WPC/browser extraction
-# causes long startup delays and makes a single bad client look like a crash.
+# Prefer clients that do not require a PO-token/browser round-trip.  The old
+# configuration started with mweb+WPC, which could spend the entire extraction
+# deadline waiting for browser/PO-token work.  mweb+WPC remains a final
+# fallback for videos that need it.
 _CLIENT_PROFILES = (
-    ("mweb", True),
     ("web_safari", False),
     ("tv", False),
-    ("web", True),
+    ("web", False),
+    ("mweb", True),
 )
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -124,10 +127,10 @@ def _common_options(client: str, use_pot: bool, **extra) -> dict:
         "no_warnings": True,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "extractor_retries": 1,
-        "fragment_retries": 2,
-        "retries": 2,
-        "socket_timeout": 12,
+        "extractor_retries": 0,
+        "fragment_retries": 1,
+        "retries": 1,
+        "socket_timeout": 8,
         "concurrent_fragment_downloads": 4,
         "buffersize": "1M",
     }
@@ -137,12 +140,11 @@ def _common_options(client: str, use_pot: bool, **extra) -> dict:
 
 
 def _format_for(video: bool) -> str:
-    # Avoid numeric format IDs such as 18: YouTube format IDs are extractor
-    # specific and are increasingly unavailable. Selector expressions let
-    # yt-dlp choose whatever formats the selected client actually exposes.
+    # Avoid hard-coded numeric IDs such as 18.  IDs can disappear for a
+    # selected YouTube client.  Selector expressions adapt to what is exposed.
     if video:
         return "best[height<=720]/best"
-    return "bestaudio[ext=m4a]/bestaudio/best"
+    return "bestaudio/best"
 
 
 def _extract_sync(url: str, video: bool, *, download: bool = False, **extra):
@@ -150,12 +152,7 @@ def _extract_sync(url: str, video: bool, *, download: bool = False, **extra):
     fmt = _format_for(video)
 
     for client, use_pot in _CLIENT_PROFILES:
-        options = _common_options(
-            client,
-            use_pot,
-            format=fmt,
-            **extra,
-        )
+        options = _common_options(client, use_pot, format=fmt, **extra)
         started = time.monotonic()
         try:
             _log(
@@ -295,8 +292,6 @@ class YouTubeResilient(LegacyYouTube):
             direct = info.get("url")
             if not direct:
                 requested = info.get("requested_formats") or []
-                # Direct playback only accepts a single URL. If yt-dlp chose
-                # separate video/audio formats, let the caller use download().
                 if len(requested) == 1:
                     direct = requested[0].get("url")
             if not direct:
@@ -348,7 +343,7 @@ class YouTubeResilient(LegacyYouTube):
         url = _youtube_url(link, bool(videoid))
 
         if songaudio:
-            fmt = format_id or "bestaudio[ext=m4a]/bestaudio/best"
+            fmt = format_id or "bestaudio/best"
             extra = {
                 "outtmpl": str(_DOWNLOAD_DIR / "%(id)s_%(format_id)s.%(ext)s"),
                 "postprocessors": [
@@ -371,18 +366,13 @@ class YouTubeResilient(LegacyYouTube):
                 "merge_output_format": "mp4",
             }
         else:
-            fmt = "bestaudio[ext=m4a]/bestaudio/best"
+            fmt = "bestaudio/best"
             extra = {"outtmpl": str(_DOWNLOAD_DIR / "%(id)s.%(ext)s")}
 
         def _download_sync():
             last_error = None
             for client, use_pot in _CLIENT_PROFILES:
-                options = _common_options(
-                    client,
-                    use_pot,
-                    format=fmt,
-                    **extra,
-                )
+                options = _common_options(client, use_pot, format=fmt, **extra)
                 try:
                     _log(
                         "info",
@@ -398,6 +388,11 @@ class YouTubeResilient(LegacyYouTube):
                             merged = prepared.with_suffix(".mp4")
                             if merged.exists():
                                 return str(merged), True
+                        if songaudio:
+                            # FFmpegExtractAudio changes the filename extension.
+                            mp3 = prepared.with_suffix(".mp3")
+                            if mp3.exists():
+                                return str(mp3), True
                         if prepared.exists():
                             return str(prepared), True
                         candidates = sorted(
