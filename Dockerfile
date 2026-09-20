@@ -12,6 +12,7 @@ RUN apt-get update \
        chromium \
        curl \
        ca-certificates \
+       unzip \
        git \
        gcc \
        procps \
