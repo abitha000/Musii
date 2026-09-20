@@ -14,26 +14,16 @@ from yt_dlp import YoutubeDL
 
 from .Youtube import YouTube as LegacyYouTube
 
-
 _LOG_TAG = "YoutubeEngine"
 _CACHE_TTL = 240.0
 _MAX_CACHE = 512
-_EXTRACT_TIMEOUT = 60.0
+_EXTRACT_TIMEOUT = 35.0
 _DOWNLOAD_TIMEOUT = 600.0
 _DOWNLOAD_DIR = Path("downloads")
 _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 _COOKIE_RUNTIME_PATH = Path("/tmp/tommy-youtube-cookies.txt")
-
-# web_safari can expose HLS formats that currently avoid GVS PO-token
-# requirements; mweb remains the recommended PO-token client and is kept
-# immediately behind it as the normal direct-stream fallback.
 _CLIENT_PROFILES = ("web_safari", "mweb", "web", "tv")
-
-_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-)
-
+_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 _STREAM_CACHE: dict[tuple[str, bool], tuple[float, str]] = {}
 _PREFETCH_TASKS: dict[tuple[str, bool], asyncio.Task] = {}
 
@@ -60,8 +50,7 @@ def _cookie_file() -> Optional[str]:
                 os.chmod(_COOKIE_RUNTIME_PATH, 0o600)
                 return str(_COOKIE_RUNTIME_PATH)
         except Exception as exc:
-            _log("warning", "failed to materialize YOUTUBE_COOKIES secret: %s", exc)
-
+            _log("warning", "failed to materialize YouTube cookies: %s", exc)
     root = Path.cwd() / "cookies"
     if not root.is_dir():
         return None
@@ -96,23 +85,20 @@ def _js_runtimes() -> dict:
     return {}
 
 
-def _common_options(client: str, **extra) -> dict:
-    extractor_args = {
-        "youtube": {
-            "player_client": [client],
-            "fetch_pot": ["auto"],
-        }
-    }
+def _common_options(client: str, *, use_pot: bool, **extra) -> dict:
+    youtube_args = {"player_client": [client]}
+    # Only invoke WPC for mweb/web clients. web_safari should stay a fast,
+    # browser-free attempt so an unavailable format cannot spend ~60s in WPC.
+    if use_pot:
+        youtube_args["fetch_pot"] = ["auto"]
+    extractor_args = {"youtube": youtube_args}
     browser = _browser_path()
-    if browser:
-        # WPC's documented option name is youtubepot-wpc:browser_path.
+    if browser and use_pot:
         extractor_args["youtubepot-wpc"] = {"browser_path": browser}
 
     opts = {
         "extractor_args": extractor_args,
         "js_runtimes": _js_runtimes(),
-        # EJS is installed with yt-dlp[default]; avoid an unnecessary
-        # GitHub fetch on every extraction in a restricted container.
         "cookiefile": _cookie_file(),
         "proxy": os.getenv("PROXY_URL", "").strip() or None,
         "http_headers": {"User-Agent": _USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
@@ -121,10 +107,10 @@ def _common_options(client: str, **extra) -> dict:
         "no_warnings": True,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "extractor_retries": 2,
-        "fragment_retries": 3,
-        "retries": 3,
-        "socket_timeout": 15,
+        "extractor_retries": 1,
+        "fragment_retries": 2,
+        "retries": 2,
+        "socket_timeout": 10,
         "concurrent_fragment_downloads": 4,
         "buffersize": "1M",
     }
@@ -133,25 +119,37 @@ def _common_options(client: str, **extra) -> dict:
     return opts
 
 
+def _format_candidates(fmt: str) -> list[str]:
+    candidates = [fmt]
+    if fmt.startswith("bestaudio"):
+        candidates.extend(["best", "18"])
+    elif fmt.startswith("best["):
+        candidates.extend(["best", "18"])
+    elif fmt == "best":
+        candidates.append("18")
+    return list(dict.fromkeys(candidates))
+
+
 def _extract_sync(url: str, fmt: str, *, download: bool = False, **extra):
     last_error = None
     for client in _CLIENT_PROFILES:
-        options = _common_options(client, format=fmt, **extra)
-        started = time.monotonic()
-        try:
-            _log("info", "extracting client=%s format=%s", client, fmt)
-            with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(url, download=download)
-            _log("info", "client=%s extraction succeeded in %.1fs", client, time.monotonic() - started)
-            return info
-        except Exception as exc:
-            last_error = exc
-            _log("warning", "client=%s failed after %.1fs: %s", client, time.monotonic() - started, exc)
+        use_pot = client in {"mweb", "web"}
+        for candidate in _format_candidates(fmt):
+            options = _common_options(client, use_pot=use_pot, format=candidate, **extra)
+            started = time.monotonic()
+            try:
+                _log("info", "extracting client=%s format=%s pot=%s", client, candidate, use_pot)
+                with YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(url, download=download)
+                _log("info", "client=%s format=%s extraction succeeded in %.1fs", client, candidate, time.monotonic() - started)
+                return info
+            except Exception as exc:
+                last_error = exc
+                _log("warning", "client=%s format=%s failed after %.1fs: %s", client, candidate, time.monotonic() - started, exc)
     raise RuntimeError(f"all YouTube extraction profiles failed: {last_error}")
 
 
 async def _extract(url: str, fmt: str, *, download: bool = False, timeout: float = _EXTRACT_TIMEOUT, **extra):
-    """Run blocking yt-dlp outside the event loop with a hard upper bound."""
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(_extract_sync, url, fmt, download=download, **extra),
@@ -202,7 +200,6 @@ class YouTubeResilient(LegacyYouTube):
                 return {"title": item["title"], "link": item["link"], "vidid": item["id"], "duration_min": item["duration"], "thumb": item["thumbnails"][0]["url"].split("?", 1)[0]}, item["id"]
         except Exception as exc:
             _log("warning", "py_yt search failed: %s", exc)
-
         info = await _extract(f"ytsearch1:{link}", "best", download=False, skip_download=True)
         entry = (info.get("entries") or [None])[0]
         if not entry:
@@ -261,7 +258,7 @@ class YouTubeResilient(LegacyYouTube):
         finally:
             _PREFETCH_TASKS.pop(key, None)
 
-    async def video(self, link: str, videoid: bool | str = None):
+    async def video(self, link: str, videoid: str | bool = None):
         return await self.stream_url(link, videoid=videoid, video=True)
 
     async def download(self, link: str, mystic, video: bool | str = None, videoid: bool | str = None, songaudio: bool | str = None, songvideo: bool | str = None, format_id: bool | str = None, title: bool | str = None):
@@ -282,26 +279,24 @@ class YouTubeResilient(LegacyYouTube):
         def _download_sync():
             last_error = None
             for client in _CLIENT_PROFILES:
-                options = _common_options(client, format=fmt, **extra)
-                try:
-                    _log("info", "download client=%s format=%s", client, fmt)
-                    with YoutubeDL(options) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                        if songaudio:
-                            expected = _DOWNLOAD_DIR / f"{info['id']}_{info.get('format_id', format_id)}.mp3"
-                            if expected.exists():
-                                return str(expected)
-                        prepared = Path(ydl.prepare_filename(info))
-                        if extra.get("merge_output_format") == "mp4" and prepared.with_suffix(".mp4").exists():
-                            return str(prepared.with_suffix(".mp4"))
-                        if prepared.exists():
-                            return str(prepared)
-                        candidates = sorted(_DOWNLOAD_DIR.glob(f"{info['id']}*"), key=lambda p: p.stat().st_mtime, reverse=True)
-                        if candidates:
-                            return str(candidates[0])
-                except Exception as exc:
-                    last_error = exc
-                    _log("warning", "download client=%s failed: %s", client, exc)
+                use_pot = client in {"mweb", "web"}
+                for candidate in _format_candidates(fmt):
+                    options = _common_options(client, use_pot=use_pot, format=candidate, **extra)
+                    try:
+                        _log("info", "download client=%s format=%s pot=%s", client, candidate, use_pot)
+                        with YoutubeDL(options) as ydl:
+                            info = ydl.extract_info(url, download=True)
+                            prepared = Path(ydl.prepare_filename(info))
+                            if extra.get("merge_output_format") == "mp4" and prepared.with_suffix(".mp4").exists():
+                                return str(prepared.with_suffix(".mp4"))
+                            if prepared.exists():
+                                return str(prepared)
+                            candidates = sorted(_DOWNLOAD_DIR.glob(f"{info['id']}*"), key=lambda p: p.stat().st_mtime, reverse=True)
+                            if candidates:
+                                return str(candidates[0])
+                    except Exception as exc:
+                        last_error = exc
+                        _log("warning", "download client=%s format=%s failed: %s", client, candidate, exc)
             raise RuntimeError(f"all YouTube download profiles failed: {last_error}")
 
         try:
