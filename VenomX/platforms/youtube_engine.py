@@ -1,18 +1,8 @@
 # All rights reserved.
-"""Resilient YouTube extraction/streaming engine for Tommy.
-
-This module is intentionally separate from the legacy Youtube.py implementation.
-It keeps the public methods used by the bot while centralising the modern yt-dlp
-configuration: EJS, a JavaScript runtime, the WebPoClient PO-token provider,
-consistent cookies/proxy handling, short-lived direct-URL caching, and safe
-single-file video streaming for PyTgCalls.
-
-A proxy is optional. If configured, the same proxy is used for extraction and
-for the media URL by the existing PyTgCalls FFmpeg path, avoiding the common
-IP-mismatch failure for signed googlevideo URLs.
-"""
+"""Resilient YouTube extraction/streaming engine for Tommy."""
 
 import asyncio
+import base64
 import os
 import shutil
 import time
@@ -30,10 +20,10 @@ _CACHE_TTL = 240.0
 _MAX_CACHE = 512
 _DOWNLOAD_DIR = Path("downloads")
 _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+_COOKIE_RUNTIME_PATH = Path("/tmp/tommy-youtube-cookies.txt")
 
-# Profiles are tried independently. This is deliberate: a single mixed client
-# list can leave yt-dlp with an unusable format set when YouTube changes one
-# client's SABR/PO-token requirements.
+# Profiles are tried independently. This avoids relying on one YouTube client
+# when YouTube changes SABR/PO-token behaviour for another client.
 _CLIENT_PROFILES = (
     "mweb",
     "web_safari",
@@ -52,10 +42,7 @@ _PREFETCH_TASKS: dict[tuple[str, bool], asyncio.Task] = {}
 
 def _log(level: str, message: str, *args):
     import logging
-
-    getattr(logging.getLogger("VenomX.platforms.youtube_engine"), level)(
-        f"[{_LOG_TAG}] {message}", *args
-    )
+    getattr(logging.getLogger("VenomX.platforms.youtube_engine"), level)(f"[{_LOG_TAG}] {message}", *args)
 
 
 def _youtube_url(value: str, videoid: bool = False) -> str:
@@ -65,6 +52,19 @@ def _youtube_url(value: str, videoid: bool = False) -> str:
 
 
 def _cookie_file() -> Optional[str]:
+    """Return a safe runtime cookie file without requiring secrets in Git."""
+    encoded = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    raw = os.getenv("YOUTUBE_COOKIES", "")
+    if encoded or raw:
+        try:
+            data = base64.b64decode(encoded).decode("utf-8") if encoded else raw
+            if "# Netscape HTTP Cookie File" in data or "# HTTP Cookie File" in data:
+                _COOKIE_RUNTIME_PATH.write_text(data)
+                os.chmod(_COOKIE_RUNTIME_PATH, 0o600)
+                return str(_COOKIE_RUNTIME_PATH)
+        except Exception as exc:
+            _log("warning", "failed to materialize YOUTUBE_COOKIES secret: %s", exc)
+
     root = Path.cwd() / "cookies"
     if not root.is_dir():
         return None
@@ -90,8 +90,6 @@ def _browser_path() -> str:
 
 
 def _js_runtimes() -> dict:
-    # yt-dlp's current Python API uses `js_runtimes`, not the legacy
-    # `js_runtime` key used by the old implementation in this repository.
     deno = shutil.which("deno")
     if deno:
         return {"deno": {"path": deno}}
@@ -137,7 +135,6 @@ def _common_options(client: str, **extra) -> dict:
         "concurrent_fragment_downloads": 4,
         "buffersize": "1M",
     }
-    # None is not a useful option value for yt-dlp's cookie/proxy fields.
     opts = {k: v for k, v in opts.items() if v is not None}
     opts.update(extra)
     return opts
@@ -170,27 +167,12 @@ class YouTubeResilient(LegacyYouTube):
 
     async def details(self, link: str, videoid: bool | str = None):
         url = _youtube_url(link, bool(videoid))
-        # Direct URL metadata is more reliable than a second py_yt search.
         if "youtube.com/" in url or "youtu.be/" in url:
-            info = await asyncio.to_thread(
-                _extract_sync,
-                url,
-                "best",
-                download=False,
-                skip_download=True,
-            )
+            info = await asyncio.to_thread(_extract_sync, url, "best", download=False, skip_download=True)
             duration = info.get("duration") or 0
             duration_min = self._duration_text(duration)
-            thumbnail = info.get("thumbnail") or (
-                f"https://img.youtube.com/vi/{info['id']}/maxresdefault.jpg"
-            )
-            return (
-                info.get("title") or "Unknown title",
-                duration_min,
-                int(duration),
-                thumbnail.split("?", 1)[0],
-                info["id"],
-            )
+            thumbnail = info.get("thumbnail") or f"https://img.youtube.com/vi/{info['id']}/maxresdefault.jpg"
+            return info.get("title") or "Unknown title", duration_min, int(duration), thumbnail.split("?", 1)[0], info["id"]
         return await super().details(link, videoid)
 
     @staticmethod
@@ -209,68 +191,40 @@ class YouTubeResilient(LegacyYouTube):
             items = data.get("result", [])
             if items:
                 item = items[0]
-                return {
-                    "title": item["title"],
-                    "link": item["link"],
-                    "vidid": item["id"],
-                    "duration_min": item["duration"],
-                    "thumb": item["thumbnails"][0]["url"].split("?", 1)[0],
-                }, item["id"]
+                return {"title": item["title"], "link": item["link"], "vidid": item["id"], "duration_min": item["duration"], "thumb": item["thumbnails"][0]["url"].split("?", 1)[0]}, item["id"]
         except Exception as exc:
             _log("warning", "py_yt search failed: %s", exc)
 
-        query = f"ytsearch1:{link}"
-        info = await asyncio.to_thread(
-            _extract_sync, query, "best", download=False, skip_download=True
-        )
+        info = await asyncio.to_thread(_extract_sync, f"ytsearch1:{link}", "best", download=False, skip_download=True)
         entry = (info.get("entries") or [None])[0]
         if not entry:
             raise RuntimeError("YouTube search returned no results")
         thumb = entry.get("thumbnail") or f"https://img.youtube.com/vi/{entry['id']}/maxresdefault.jpg"
-        result = {
-            "title": entry.get("title") or "Unknown title",
-            "link": entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry['id']}",
-            "vidid": entry["id"],
-            "duration_min": self._duration_text(entry.get("duration") or 0),
-            "thumb": thumb.split("?", 1)[0],
-        }
+        result = {"title": entry.get("title") or "Unknown title", "link": entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry['id']}", "vidid": entry["id"], "duration_min": self._duration_text(entry.get("duration") or 0), "thumb": thumb.split("?", 1)[0]}
         return result, entry["id"]
 
     async def title(self, link: str, videoid: bool | str = None):
-        details = await self.details(link, videoid)
-        return details[0]
+        return (await self.details(link, videoid))[0]
 
     async def duration(self, link: str, videoid: bool | str = None):
-        details = await self.details(link, videoid)
-        return details[1]
+        return (await self.details(link, videoid))[1]
 
     async def thumbnail(self, link: str, videoid: bool | str = None):
-        details = await self.details(link, videoid)
-        return details[3]
+        return (await self.details(link, videoid))[3]
 
     async def stream_url(self, link: str, videoid: bool | str = None, video: bool = False):
-        vid = str(link) if videoid else ""
-        key = (vid or link, bool(video))
+        key = (str(link), bool(video))
         cached = _STREAM_CACHE.get(key)
         if cached and time.monotonic() - cached[0] < _CACHE_TTL:
             return 1, cached[1]
-        if videoid:
-            url = _youtube_url(link, True)
-        else:
-            url = _youtube_url(link)
-
-        # PyTgCalls accepts one media URL. For video, deliberately select a
-        # single-file (audio+video) format capped at Telegram's 720p ceiling.
-        # This avoids the old bug where yt-dlp returned two URLs and the code
-        # silently selected video-only, producing video without audio.
+        url = _youtube_url(link, bool(videoid))
+        # PyTgCalls accepts one media URL. For video, select a single-file
+        # audio+video format capped at 720p to prevent the old video-only URL bug.
         fmt = "best[height<=720]/18/best" if video else "bestaudio/best/18"
         try:
-            info = await asyncio.to_thread(
-                _extract_sync, url, fmt, download=False, skip_download=True
-            )
+            info = await asyncio.to_thread(_extract_sync, url, fmt, download=False, skip_download=True)
             direct = info.get("url")
             if not direct:
-                # Some extractors populate requested_formats instead of url.
                 requested = info.get("requested_formats") or []
                 if requested and requested[0].get("url"):
                     direct = requested[0]["url"]
@@ -284,7 +238,6 @@ class YouTubeResilient(LegacyYouTube):
             return 0, str(exc)
 
     async def prefetch(self, videoid: str, video: bool = False):
-        """Warm a short-lived direct URL for the next queued YouTube item."""
         key = (videoid, bool(video))
         if key in _STREAM_CACHE and time.monotonic() - _STREAM_CACHE[key][0] < _CACHE_TTL:
             return
@@ -303,38 +256,17 @@ class YouTubeResilient(LegacyYouTube):
     async def video(self, link: str, videoid: bool | str = None):
         return await self.stream_url(link, videoid=videoid, video=True)
 
-    async def download(
-        self,
-        link: str,
-        mystic,
-        video: bool | str = None,
-        videoid: bool | str = None,
-        songaudio: bool | str = None,
-        songvideo: bool | str = None,
-        format_id: bool | str = None,
-        title: bool | str = None,
-    ):
+    async def download(self, link: str, mystic, video: bool | str = None, videoid: bool | str = None, songaudio: bool | str = None, songvideo: bool | str = None, format_id: bool | str = None, title: bool | str = None):
         url = _youtube_url(link, bool(videoid))
         if songaudio:
             fmt = format_id or "bestaudio/best"
-            postprocessors = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"}]
-            extra = {
-                "outtmpl": str(_DOWNLOAD_DIR / "%(id)s_%(format_id)s.%(ext)s"),
-                "postprocessors": postprocessors,
-                "postprocessor_args": {"ffmpeg": ["-b:a", "320k"]},
-            }
+            extra = {"outtmpl": str(_DOWNLOAD_DIR / "%(id)s_%(format_id)s.%(ext)s"), "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"}], "postprocessor_args": {"ffmpeg": ["-b:a", "320k"]}}
         elif songvideo:
             fmt = f"{format_id}+bestaudio/best" if format_id else "bv*[height<=720]+ba/b[height<=720]"
-            extra = {
-                "outtmpl": str(_DOWNLOAD_DIR / "%(id)s_%(format_id)s.%(ext)s"),
-                "merge_output_format": "mp4",
-            }
+            extra = {"outtmpl": str(_DOWNLOAD_DIR / "%(id)s_%(format_id)s.%(ext)s"), "merge_output_format": "mp4"}
         elif video:
             fmt = "bv*[height<=720]+ba/b[height<=720]"
-            extra = {
-                "outtmpl": str(_DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-                "merge_output_format": "mp4",
-            }
+            extra = {"outtmpl": str(_DOWNLOAD_DIR / "%(id)s.%(ext)s"), "merge_output_format": "mp4"}
         else:
             fmt = "bestaudio/best"
             extra = {"outtmpl": str(_DOWNLOAD_DIR / "%(id)s.%(ext)s")}
@@ -351,10 +283,8 @@ class YouTubeResilient(LegacyYouTube):
                             if expected.exists():
                                 return str(expected)
                         prepared = Path(ydl.prepare_filename(info))
-                        if extra.get("merge_output_format") == "mp4":
-                            merged = prepared.with_suffix(".mp4")
-                            if merged.exists():
-                                return str(merged)
+                        if extra.get("merge_output_format") == "mp4" and prepared.with_suffix(".mp4").exists():
+                            return str(prepared.with_suffix(".mp4"))
                         if prepared.exists():
                             return str(prepared)
                         candidates = sorted(_DOWNLOAD_DIR.glob(f"{info['id']}*"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -365,11 +295,8 @@ class YouTubeResilient(LegacyYouTube):
                     _log("warning", "download client=%s failed: %s", client, exc)
             raise RuntimeError(f"all YouTube download profiles failed: {last_error}")
 
-        try:
-            path = await asyncio.to_thread(_download_sync)
-            return path, True
-        except Exception:
-            raise
+        path = await asyncio.to_thread(_download_sync)
+        return path, True
 
 
 __all__ = ["YouTubeResilient"]
