@@ -1,5 +1,10 @@
 # All rights reserved.
-"""Reliable YouTube resolver for Musii using cookies + bgutil PO tokens."""
+"""Reliable YouTube resolver for Musii.
+
+Playback is intentionally cookie-free by default.  A PO-token provider is used
+first, with logged-out client fallbacks.  Cookies are an optional last resort
+for content that genuinely requires an authenticated YouTube session.
+"""
 import asyncio
 import base64
 import logging
@@ -35,6 +40,12 @@ def _youtube_url(value: str, videoid: bool = False) -> str:
 
 
 def _cookie_file() -> Optional[str]:
+    """Return an explicitly configured cookie file, if one exists.
+
+    Cookies are deliberately optional.  Do not silently download or borrow
+    third-party account cookies; authenticated playback is only enabled when
+    the operator explicitly supplies a cookie secret/file.
+    """
     encoded = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     raw = os.getenv("YOUTUBE_COOKIES", "")
     configured = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
@@ -70,10 +81,19 @@ def _js_runtimes() -> dict:
 
 def _common_options(client: Optional[str], use_pot: bool, **extra) -> dict:
     extractor_args: dict = {}
+    youtube_args: dict = {}
+    visitor_data = os.getenv("YOUTUBE_VISITOR_DATA", "").strip()
     if client:
-        youtube_args = {"player_client": [client]}
-        if use_pot:
-            youtube_args["fetch_pot"] = ["auto"]
+        youtube_args["player_client"] = [client]
+    if use_pot:
+        youtube_args["fetch_pot"] = ["auto"]
+    # Visitor data is a cookie-free, logged-out fallback.  It must be paired
+    # with skipped webpage/config requests so yt-dlp does not overwrite it.
+    if visitor_data:
+        youtube_args["visitor_data"] = [visitor_data]
+        youtube_args["player_skip"] = ["webpage", "configs"]
+        extractor_args["youtubetab"] = {"skip": ["webpage"]}
+    if youtube_args:
         extractor_args["youtube"] = youtube_args
     if use_pot:
         extractor_args["youtubepot-bgutilhttp"] = {
@@ -105,10 +125,19 @@ def _common_options(client: Optional[str], use_pot: bool, **extra) -> dict:
 
 
 def _client_profiles() -> tuple[tuple[Optional[str], bool], ...]:
-    profiles: list[tuple[Optional[str], bool]] = [("mweb", True), (None, False)]
+    """Ordered profiles: no-account first; authenticated only as fallback."""
+    profiles: list[tuple[Optional[str], bool]] = [
+        ("mweb", True),          # primary: bgutil PO token, no account
+        ("web_safari", False),   # HLS-friendly logged-out fallback
+        ("android_vr", False),   # logged-out fallback
+        ("web_embedded", False), # embeddable public videos
+        (None, False),            # yt-dlp's current guest/default strategy
+    ]
     if _cookie_file():
-        profiles.append(("web_creator", False))
-    profiles.append(("web_embedded", False))
+        profiles.extend([
+            ("web_creator", False),
+            ("web", False),
+        ])
     return tuple(profiles)
 
 
@@ -131,7 +160,7 @@ def _extract_sync(url: str, video: bool, *, download: bool = False, **extra):
                 opts["format"] = fmt
             else:
                 opts.setdefault("extract_flat", True)
-            _log("info", "extracting client=%s format=%s pot=%s download=%s", label, fmt or "search", use_pot, download)
+            _log("info", "extracting client=%s format=%s pot=%s cookies=%s", label, fmt or "search", use_pot, bool(opts.get("cookiefile")))
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
             if not info:
@@ -234,8 +263,8 @@ class YouTubeResilient(LegacyYouTube):
             return 1, direct
         except Exception as exc:
             text = str(exc)
-            if ("age-restricted" in text.lower() or "confirm your age" in text.lower()) and not _cookie_file():
-                text = "YouTube requires an authenticated age-verified session; configure YOUTUBE_COOKIES_B64."
+            if ("age-restricted" in text.lower() or "confirm your age" in text.lower() or "sign in" in text.lower()) and not _cookie_file():
+                text = "YouTube requires an authenticated session for this video; normal public videos remain cookie-free."
             _log("error", "stream_url failed: %s", text[:500])
             return 0, text
 
