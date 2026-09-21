@@ -1,4 +1,5 @@
 async-lru
+aiocache
 aiofiles
 aiohttp
 beautifulsoup4
@@ -26,6 +27,6 @@ uvloop
 flask
 gunicorn
 yt-dlp[default]>=2026.08.19
-yt-dlp-getpot-wpc==1.1.2
+bgutil-ytdlp-pot-provider>=2.0.0
 py-yt-search>=0.2
 pyroblack
