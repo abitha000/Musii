@@ -1,9 +1,10 @@
 # All rights reserved.
 """Reliable YouTube resolver for Musii.
 
-Playback is intentionally cookie-free by default.  A PO-token provider is used
-first, with logged-out client fallbacks.  Cookies are an optional last resort
-for content that genuinely requires an authenticated YouTube session.
+Playback is cookie-free by default.  If an external PO-token provider is
+configured, the PO-token path is preferred.  Otherwise Musii uses lightweight
+logged-out YouTube clients and never starts a local browser/token service.
+Cookies remain an explicit operator-provided fallback only.
 """
 import asyncio
 import base64
@@ -40,12 +41,7 @@ def _youtube_url(value: str, videoid: bool = False) -> str:
 
 
 def _cookie_file() -> Optional[str]:
-    """Return an explicitly configured cookie file, if one exists.
-
-    Cookies are deliberately optional.  Do not silently download or borrow
-    third-party account cookies; authenticated playback is only enabled when
-    the operator explicitly supplies a cookie secret/file.
-    """
+    """Return only an explicitly supplied cookie file/secret."""
     encoded = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     raw = os.getenv("YOUTUBE_COOKIES", "")
     configured = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
@@ -62,19 +58,17 @@ def _cookie_file() -> Optional[str]:
             _log("warning", "failed to materialize YouTube cookies: %s", exc)
     if configured and Path(configured).is_file():
         return configured
-    root = Path.cwd() / "cookies"
-    if root.is_dir():
-        for path in sorted(root.glob("*.txt")):
-            try:
-                head = path.read_text(errors="ignore")[:300]
-            except OSError:
-                continue
-            if "# Netscape HTTP Cookie File" in head or "# HTTP Cookie File" in head:
-                return str(path)
     return None
 
 
+def _pot_enabled() -> bool:
+    return os.getenv("YOUTUBE_POT_PROVIDER_ENABLED", "0").strip() == "1" and bool(
+        os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip()
+    )
+
+
 def _js_runtimes() -> dict:
+    # Deno is used only by yt-dlp's JS extraction; no browser process is started.
     deno = Path("/usr/local/deno/bin/deno")
     return {"deno": {"path": str(deno)}} if deno.is_file() else {}
 
@@ -87,8 +81,6 @@ def _common_options(client: Optional[str], use_pot: bool, **extra) -> dict:
         youtube_args["player_client"] = [client]
     if use_pot:
         youtube_args["fetch_pot"] = ["auto"]
-    # Visitor data is a cookie-free, logged-out fallback.  It must be paired
-    # with skipped webpage/config requests so yt-dlp does not overwrite it.
     if visitor_data:
         youtube_args["visitor_data"] = [visitor_data]
         youtube_args["player_skip"] = ["webpage", "configs"]
@@ -97,7 +89,7 @@ def _common_options(client: Optional[str], use_pot: bool, **extra) -> dict:
         extractor_args["youtube"] = youtube_args
     if use_pot:
         extractor_args["youtubepot-bgutilhttp"] = {
-            "base_url": os.getenv("YOUTUBE_POT_PROVIDER_URL", "http://127.0.0.1:4416")
+            "base_url": os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip()
         }
     options = {
         "extractor_args": extractor_args,
@@ -125,14 +117,17 @@ def _common_options(client: Optional[str], use_pot: bool, **extra) -> dict:
 
 
 def _client_profiles() -> tuple[tuple[Optional[str], bool], ...]:
-    """Ordered profiles: no-account first; authenticated only as fallback."""
-    profiles: list[tuple[Optional[str], bool]] = [
-        ("mweb", True),          # primary: bgutil PO token, no account
-        ("web_safari", False),   # HLS-friendly logged-out fallback
-        ("android_vr", False),   # logged-out fallback
-        ("web_embedded", False), # embeddable public videos
-        (None, False),            # yt-dlp's current guest/default strategy
-    ]
+    """PO-token first only when a real external provider is configured."""
+    profiles: list[tuple[Optional[str], bool]] = []
+    if _pot_enabled():
+        profiles.append(("mweb", True))
+    profiles.extend([
+        ("mweb", False),
+        ("web_safari", False),
+        ("android_vr", False),
+        ("web_embedded", False),
+        (None, False),
+    ])
     if _cookie_file():
         profiles.extend([
             ("web_creator", False),
