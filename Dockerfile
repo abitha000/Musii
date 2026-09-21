@@ -3,8 +3,7 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    DENO_INSTALL=/usr/local/deno \
-    YOUTUBE_POT_PROVIDER_URL=http://127.0.0.1:4416 \
+    YOUTUBE_POT_PROVIDER_ENABLED=0 \
     TINI_SUBREAPER=1
 
 RUN apt-get update \
@@ -12,25 +11,12 @@ RUN apt-get update \
        ffmpeg \
        aria2 \
        chromium \
-       curl \
        ca-certificates \
        unzip \
-       git \
-       gcc \
        procps \
        tini \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-
-RUN mkdir -p "$DENO_INSTALL" \
-    && curl -fsSL https://deno.land/install.sh | sh \
-    && ln -sf "$DENO_INSTALL/bin/deno" /usr/local/bin/deno
-
-# Build the official bgutil POT HTTP provider alongside Musii.
-RUN git clone --depth 1 --branch 2.0.0 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil \
-    && cd /opt/bgutil/server \
-    && deno install --allow-scripts=npm:canvas --frozen \
-    && chown -R root:root /opt/bgutil
 
 WORKDIR /app
 COPY requirements.txt ./
